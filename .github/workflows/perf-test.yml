@@ -1,9 +1,7 @@
 name: Performance Tests
 
 on:
-  schedule:
-    # Run daily at 06:00 UTC
-    - cron: "0 6 * * *"
+  # Fork policy: run on demand; inherited daily real-model benchmarks are costly.
   workflow_dispatch:
     inputs:
       scale:
@@ -14,7 +12,7 @@ on:
           - small
           - medium
           - large
-        default: large
+        default: small
       suite:
         description: "Perf-test suite to run (blank = all)"
         type: choice
@@ -30,7 +28,7 @@ on:
       amb_skip:
         description: "Skip the AMB benchmark job (LoComo + LongMemEval)"
         type: boolean
-        default: false
+        default: true
       amb_args:
         description: "Extra `amb run` arguments, e.g. --unit conv-26 --query-limit 20"
         type: string
@@ -38,7 +36,7 @@ on:
       obs_skip:
         description: "Skip observation-dedup benchmark job"
         type: boolean
-        default: false
+        default: true
       obs_dataset:
         description: "Obs benchmark dataset substring (blank = English hermes transcript)."
         type: string
@@ -50,7 +48,7 @@ on:
       system_evals_skip:
         description: "Skip the system-evals quality job (knowledge pages, reflect answers, retain language, retain fidelity)"
         type: boolean
-        default: false
+        default: true
       system_evals_mode:
         description: "system-evals mode: full (every category) or minimum (only the cases that have regressed)."
         type: choice
@@ -63,13 +61,66 @@ on:
         type: string
         default: ""
 
+permissions:
+  contents: read
+
 concurrency:
-  group: perf-test
+  group: perf-test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  perf-test:
+  # Check credentials before any model download or dependency installation.
+  # Outputs expose only availability, never credential contents.
+  prerequisites:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      vertexai: ${{ steps.check.outputs.vertexai }}
+      amb: ${{ steps.check.outputs.amb }}
+      dashboard: ${{ steps.check.outputs.dashboard }}
+    steps:
+    - name: Check optional service credentials
+      id: check
+      env:
+        GCP_VERTEXAI_CREDENTIALS: ${{ secrets.GCP_VERTEXAI_CREDENTIALS }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        PERF_DASHBOARD_TOKEN: ${{ secrets.PERF_DASHBOARD_TOKEN }}
+      run: |
+        vertexai=false
+        if [ -n "$GCP_VERTEXAI_CREDENTIALS" ] && printf '%s' "$GCP_VERTEXAI_CREDENTIALS" | jq -e '
+          type == "object" and .type == "service_account" and
+          (.project_id | type == "string" and length > 0) and
+          (.client_email | type == "string" and length > 0) and
+          (.private_key | type == "string" and length > 0)
+        ' >/dev/null 2>&1; then
+          vertexai=true
+        fi
+        amb=false
+        if [ "$vertexai" = true ] && [ -n "$GEMINI_API_KEY" ]; then amb=true; fi
+        dashboard=false
+        # All publisher scripts default to the upstream dashboard repository.
+        if [ "$GITHUB_REPOSITORY" = "vectorize-io/hindsight" ] && [ -n "$PERF_DASHBOARD_TOKEN" ]; then
+          dashboard=true
+        fi
+        {
+          echo "vertexai=$vertexai"
+          echo "amb=$amb"
+          echo "dashboard=$dashboard"
+        } >> "$GITHUB_OUTPUT"
+        {
+          echo "### Optional benchmark prerequisites"
+          echo "- Vertex AI credentials structurally valid: $vertexai"
+          echo "- AMB prerequisites available: $amb"
+          echo "- Upstream dashboard publishing enabled: $dashboard"
+          echo "Quality jobs require both opt-in (their skip input set to false) and credentials."
+          echo "Missing prerequisites skip those jobs; basic perf-test still runs."
+          echo "Credential availability does not verify service permissions, quotas or key validity."
+        } >> "$GITHUB_STEP_SUMMARY"
+
+  perf-test:
+    needs: prerequisites
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
     - uses: actions/checkout@v6
       with:
@@ -109,14 +160,15 @@ jobs:
         cd hindsight-dev && uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Run perf-test
+      env:
+        PERF_SUITE: ${{ inputs.suite }}
+        PERF_SCALE: ${{ inputs.scale || 'small' }}
       run: |
-        SUITE_ARG=""
-        if [ -n "${{ inputs.suite }}" ]; then
-          SUITE_ARG="--suite ${{ inputs.suite }}"
-        fi
+        SUITE_ARGS=()
+        if [ -n "$PERF_SUITE" ]; then SUITE_ARGS=(--suite "$PERF_SUITE"); fi
         ./scripts/benchmarks/run-perf-test.sh \
-          --scale ${{ inputs.scale || 'large' }} \
-          $SUITE_ARG \
+          --scale "$PERF_SCALE" \
+          "${SUITE_ARGS[@]}" \
           --output perf-results.json
 
     - name: Upload perf results
@@ -132,7 +184,7 @@ jobs:
     #   https://vectorize-io.github.io/hindsight-continuous-performance-monitor/
     # reads data/index.json + data/<run>.json and renders charts client-side.
     - name: Publish to dashboard
-      if: github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+      if: success() && needs.prerequisites.outputs.dashboard == 'true'
       env:
         PERF_DASHBOARD_TOKEN: ${{ secrets.PERF_DASHBOARD_TOKEN }}
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -145,7 +197,8 @@ jobs:
     # points AMB's `hindsight-http` provider at it — see
     # hindsight-system-evals/README.md. It replaced a second in-repo copy of the
     # same two datasets, which was free to drift from the published ones.
-    if: inputs.amb_skip != true
+    needs: prerequisites
+    if: inputs.amb_skip == false && needs.prerequisites.outputs.amb == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
@@ -174,8 +227,11 @@ jobs:
         ref: ${{ inputs.ref || github.ref }}
 
     - name: Setup GCP credentials
+      env:
+        GCP_VERTEXAI_CREDENTIALS: ${{ secrets.GCP_VERTEXAI_CREDENTIALS }}
       run: |
-        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        umask 077
+        printf '%s' "$GCP_VERTEXAI_CREDENTIALS" > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
@@ -220,6 +276,8 @@ jobs:
         (cd hindsight-system-evals && uv sync)
 
     - name: Run AMB
+      env:
+        AMB_ARGS: ${{ inputs.amb_args }}
       run: |
         # Fail here rather than 40 minutes in, mid-dataset: AMB answers and
         # judges through the Gemini API key, not the VertexAI service account.
@@ -228,7 +286,8 @@ jobs:
           exit 1
         fi
         cd hindsight-system-evals
-        uv run run-amb --dataset ${{ matrix.dataset }} --split ${{ matrix.split }} -- ${{ inputs.amb_args }}
+        read -r -a EXTRA_ARGS <<< "$AMB_ARGS"
+        uv run run-amb --dataset ${{ matrix.dataset }} --split ${{ matrix.split }} -- "${EXTRA_ARGS[@]}"
 
     - name: Upload AMB results
       if: always()
@@ -242,7 +301,7 @@ jobs:
       # LoComo only: the monitor's locomo series is 86 runs deep and the script
       # writes data/locomo/. LongMemEval has no series there, and inventing one
       # is not this change. AMB's own numbers still go to agentmemorybenchmark.ai.
-      if: success() && matrix.dataset == 'locomo' && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      if: success() && matrix.dataset == 'locomo' && needs.prerequisites.outputs.dashboard == 'true'
       env:
         PERF_DASHBOARD_TOKEN: ${{ secrets.PERF_DASHBOARD_TOKEN }}
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -254,8 +313,10 @@ jobs:
     # Observation-dedup quality benchmark: ingests a transcript, drains consolidation
     # (serial SyncTaskBackend + embedded pg0 — no external DB / worker), and reports the
     # near-duplicate observation rate. Real LLM via VertexAI, like the other quality jobs.
-    if: inputs.obs_skip != true
+    needs: prerequisites
+    if: inputs.obs_skip == false && needs.prerequisites.outputs.vertexai == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       HINDSIGHT_API_LLM_PROVIDER: vertexai
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
@@ -267,8 +328,11 @@ jobs:
         ref: ${{ inputs.ref || github.ref }}
 
     - name: Setup GCP credentials
+      env:
+        GCP_VERTEXAI_CREDENTIALS: ${{ secrets.GCP_VERTEXAI_CREDENTIALS }}
       run: |
-        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        umask 077
+        printf '%s' "$GCP_VERTEXAI_CREDENTIALS" > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
@@ -309,10 +373,13 @@ jobs:
       # Default to the English hermes transcript at full fraction — a clean, deterministic
       # consolidation-dedup signal (the Chinese variant adds a cross-lingual embedding
       # confound). Override dataset/fraction via workflow_dispatch.
+      env:
+        OBS_DATASET: ${{ inputs.obs_dataset }}
+        OBS_FRACTION: ${{ inputs.obs_fraction }}
       run: |
-        DATASET="${{ inputs.obs_dataset }}"
+        DATASET="$OBS_DATASET"
         if [ -z "$DATASET" ]; then DATASET="hermes_session_2026-05-15_en"; fi
-        FRACTION="${{ inputs.obs_fraction }}"
+        FRACTION="$OBS_FRACTION"
         if [ -z "$FRACTION" ]; then FRACTION="1.0"; fi
         cd hindsight-dev
         uv run python -m benchmarks.obs.obs_benchmark \
@@ -327,7 +394,7 @@ jobs:
         retention-days: 90
 
     - name: Publish obs to dashboard
-      if: success() && (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      if: success() && needs.prerequisites.outputs.dashboard == 'true'
       env:
         PERF_DASHBOARD_TOKEN: ${{ secrets.PERF_DASHBOARD_TOKEN }}
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -341,7 +408,8 @@ jobs:
     # same shape as hindsight-system-tests — except the model is REAL, because a
     # quality eval against a stub would score the stub. That also means it needs
     # provider secrets, which is why it lives here and not in the PR workflow.
-    if: inputs.system_evals_skip != true
+    needs: prerequisites
+    if: inputs.system_evals_skip == false && needs.prerequisites.outputs.vertexai == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -358,8 +426,11 @@ jobs:
         ref: ${{ inputs.ref || github.ref }}
 
     - name: Setup GCP credentials
+      env:
+        GCP_VERTEXAI_CREDENTIALS: ${{ secrets.GCP_VERTEXAI_CREDENTIALS }}
       run: |
-        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        umask 077
+        printf '%s' "$GCP_VERTEXAI_CREDENTIALS" > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
@@ -414,7 +485,7 @@ jobs:
       if: >-
         always() &&
         hashFiles('hindsight-system-evals/system-evals-results.json') != '' &&
-        (github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        needs.prerequisites.outputs.dashboard == 'true'
       env:
         PERF_DASHBOARD_TOKEN: ${{ secrets.PERF_DASHBOARD_TOKEN }}
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
